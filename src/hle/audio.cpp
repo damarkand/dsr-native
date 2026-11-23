@@ -8,6 +8,7 @@
 #include <vector>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <chrono>
 #include <string>
@@ -86,12 +87,14 @@ public:
     void Start() {
         if (running_) return;
         running_ = true;
+        // Decided once: the stream may be lost and reopened (Play) while the pacer runs.
+        pacing_ = Smooth();
 #if defined(__ANDROID__)
         if (stream_) AAudioStream_requestStart(stream_);
 #endif
         worker_ = std::thread([this] { Run(); });
 #if defined(__ANDROID__)
-        if (Smooth()) pacer_ = std::thread([this] { Pace(); });
+        if (pacing_) pacer_ = std::thread([this] { Pace(); });
 #endif
     }
 
@@ -160,7 +163,7 @@ private:
             {
                 std::lock_guard<std::mutex> lk(m_);
                 queued_.pop_front();
-                if (Smooth()) {
+                if (pacing_) {
                     accepted_.push_back({b, written_});
                 } else {
                     released_.push_back(b);
@@ -197,8 +200,8 @@ private:
 #if defined(__ANDROID__)
         int64_t last_read = -1;
         std::chrono::steady_clock::time_point last_change{};
-        const int32_t burst = std::max<int32_t>(1, AAudioStream_getFramesPerBurst(stream_));
-        const int32_t buffer = std::max<int32_t>(burst, AAudioStream_getBufferSizeInFrames(stream_));
+        uint32_t gen = ~0u;
+        int32_t burst = 1, buffer = 1;
         for (;;) {
             {
                 std::unique_lock<std::mutex> lk(m_);
@@ -211,13 +214,31 @@ private:
                 if (accepted_.empty()) continue;
             }
             const auto now = std::chrono::steady_clock::now();
-            const int64_t read = AAudioStream_getFramesRead(stream_);
-            if (read != last_read) {
-                last_read = read;
-                last_change = now;
+            // The worker closes and reopens the stream after a disconnect (Play): read it under stream_m_. A new
+            // stream counts from 0; read_base_ is what was written before it.
+            int64_t read = -1;
+            {
+                std::lock_guard<std::mutex> lk(stream_m_);
+                if (stream_) {
+                    if (gen != stream_gen_) {
+                        gen = stream_gen_;
+                        burst = std::max<int32_t>(1, AAudioStream_getFramesPerBurst(stream_));
+                        buffer = std::max<int32_t>(burst, AAudioStream_getBufferSizeInFrames(stream_));
+                        last_read = -1;
+                    }
+                    read = int64_t(read_base_) + AAudioStream_getFramesRead(stream_);
+                }
             }
-            const double since = std::chrono::duration<double>(now - last_change).count();
-            const double pos = double(read) + std::min(double(burst), since * kSampleRate);
+            // No stream (lost, not reopened yet): Play consumed the buffers in real time, release them all.
+            double pos = std::numeric_limits<double>::infinity();
+            if (read >= 0) {
+                if (read != last_read) {
+                    last_read = read;
+                    last_change = now;
+                }
+                const double since = std::chrono::duration<double>(now - last_change).count();
+                pos = double(read) + std::min(double(burst), since * kSampleRate);
+            }
             int n = 0;
             {
                 std::lock_guard<std::mutex> lk(m_);
@@ -284,9 +305,10 @@ private:
 #if defined(__ANDROID__)
             if (stream_) xruns = AAudioStream_getXRunCount(stream_);
 #endif
-            LOGI(kTag, "audio out (%d ch): %llu buffers, %.1f s played, peak level %d/32767 (%s), %d underruns",
+            LOGI(kTag, "audio out (%d ch): %llu buffers, %.1f s played, peak level %d/32767 (%s), %d underruns%s",
                  channels_, (unsigned long long)buffers_played_, double(frames_played_) / kSampleRate, peak_,
-                 peak_ < 64 ? "silence" : "sound", xruns);
+                 peak_ < 64 ? "silence" : "sound", xruns,
+                 reopens_ ? (", stream reopened " + std::to_string(reopens_) + "x").c_str() : "");
             next_report_ = frames_played_ + 10 * kSampleRate;
             peak_ = 0;
         }
@@ -294,23 +316,61 @@ private:
 
     void Play(const int16_t* pcm, size_t frames) {
 #if defined(__ANDROID__)
-        if (stream_) {
-            while (frames) {
-                aaudio_result_t n = AAudioStream_write(stream_, pcm, int32_t(frames), 100'000'000);
-                if (n < 0) {
-                    LOGW(kTag, "AAudio write failed: %s", AAudio_convertResultToText(n));
-                    break;
+        const size_t total = frames;
+        if (!stream_ && lost_) Reopen(0);  // no-op until the retry time
+        while (stream_ && frames) {
+            aaudio_result_t n = AAudioStream_write(stream_, pcm, int32_t(frames), 100'000'000);
+            if (n < 0) {
+                // The output device changed (headphones, Bluetooth) or the audio server restarted: the stream
+                // stays dead until reopened. Before, every write failed at once (200k+ log lines), the buffers were
+                // released unpaced, FMOD's mixer spun a core, and there was no sound until a restart.
+                if (n == AAUDIO_ERROR_DISCONNECTED || AAudioStream_getState(stream_) == AAUDIO_STREAM_STATE_DISCONNECTED) {
+                    if (!lost_) LOGW(kTag, "AAudio stream disconnected: reopening");
+                    lost_ = true;
+                    Reopen(total - frames);  // may leave no stream: the rest is consumed in real time below
+                    continue;
                 }
-                pcm += size_t(n) * kChannels;
-                frames -= size_t(n);
+                if (write_errors_++ < 10 || write_errors_ % 1000 == 0)
+                    LOGW(kTag, "AAudio write failed: %s (%d so far)", AAudio_convertResultToText(n), write_errors_);
+                break;
             }
-            return;
+            pcm += size_t(n) * kChannels;
+            frames -= size_t(n);
         }
 #endif
         (void)pcm;
-        // Null sink: consume in real time.
-        std::this_thread::sleep_for(std::chrono::microseconds(frames * 1'000'000 / kSampleRate));
+        // Null sink, a lost stream not reopened yet, or a failed write: consume in real time, so the game's audio
+        // keeps its pace.
+        if (frames) std::this_thread::sleep_for(std::chrono::microseconds(frames * 1'000'000 / kSampleRate));
     }
+
+#if defined(__ANDROID__)
+    // Worker (Play): closes the lost stream and opens a new one, at most once per retry period: 1 s, doubling up to
+    // 32 s while reopening keeps failing or the new stream is lost again within a minute (no log flood). The pacer
+    // reads the stream, so it is swapped under stream_m_. `consumed`: frames of the current buffer already written.
+    void Reopen(size_t consumed) {
+        using clock = std::chrono::steady_clock;
+        const auto now = clock::now();
+        std::lock_guard<std::mutex> lk(stream_m_);
+        if (stream_) {
+            AAudioStream_requestStop(stream_);
+            AAudioStream_close(stream_);
+            stream_ = nullptr;
+        }
+        if (now < next_reopen_) return;
+        reopen_wait_ = now - last_reopen_ > std::chrono::seconds(60) ? std::chrono::seconds(1)
+                                                                      : std::min(reopen_wait_ * 2, std::chrono::seconds(32));
+        last_reopen_ = now;
+        next_reopen_ = now + reopen_wait_;
+        Open();
+        if (!stream_) return;
+        reopens_++;
+        lost_ = false;
+        stream_gen_++;
+        read_base_ = written_ + consumed;  // the pacer's position: the new stream's reads count from here
+        AAudioStream_requestStart(stream_);
+    }
+#endif
 
     void* event_;
     int channels_;
@@ -327,8 +387,18 @@ private:
     bool smooth_ = dsr::GetRuntime().config.audio_smooth;
     std::thread worker_;
     bool running_ = false;
+    bool pacing_ = false;  // the pacer thread releases the buffers (audio_smooth with a stream at Start)
+    int reopens_ = 0;      // streams reopened after a disconnect
 #if defined(__ANDROID__)
+    // stream_ is changed only by the worker (Reopen, under stream_m_) and by Open / Stop while no thread runs.
     AAudioStream* stream_ = nullptr;
+    std::mutex stream_m_;
+    uint32_t stream_gen_ = 0;  // bumped per reopened stream (the pacer re-reads its burst and buffer size)
+    uint64_t read_base_ = 0;   // frames written before the current stream
+    bool lost_ = false;        // the stream was disconnected; Play retries opening one
+    int write_errors_ = 0;
+    std::chrono::steady_clock::time_point last_reopen_{}, next_reopen_{};
+    std::chrono::seconds reopen_wait_{1};
 #endif
 };
 
