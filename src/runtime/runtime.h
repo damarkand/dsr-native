@@ -75,6 +75,12 @@ struct RuntimeConfig {
     // mali_barriers = 1 (PR #13): narrow layout-transition barriers (destination = the stages that use the image) and
     // render targets made readable when their pass ends, so a tile-based GPU (Mali) can overlap passes. Off by default.
     bool mali_barriers = false;
+    // GPU time ("GPU busy" in the log, the GPU side of fps = auto) on drivers where it reads 0 (Mali G76 r26).
+    // gpu_timestamps = 1: per-submission timestamps even when the driver reports timestampComputeAndGraphics = 0
+    // (only if the queue has timestamp bits). gpu_time_fences = 1: time from when submissions finish instead (a
+    // thread waits for a fence after each one), for drivers whose timestamps read 0. Off by default.
+    bool gpu_timestamps = false;
+    bool gpu_time_fences = false;
     // performance_mode = 1: the engine's own lower-quality options: low-quality effects, 1024x1024 shadow maps instead
     // of 2048x2048 (read at start-up). The menu also sets render_scale 0.75 when it is turned on.
     bool performance_mode = false;

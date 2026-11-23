@@ -1514,6 +1514,7 @@ private:
             LOGE(kTag, "no graphics queue — continuing without graphics");
             return false;
         }
+        ts_valid_bits_ = qf[family_].timestampValidBits;
 
         // Features: dynamic rendering is required for draws; the rest are used when present.
         VkPhysicalDeviceVulkan13Features have13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
@@ -1626,7 +1627,8 @@ private:
             vkAllocateCommandBuffers(device_, &cai, &sl.cmd);
             VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
             vkCreateFence(device_, &fci, nullptr, &sl.fence);
-            if (props_.limits.timestampComputeAndGraphics) {
+            if (props_.limits.timestampComputeAndGraphics ||
+                (dsr::GetRuntime().config.gpu_timestamps && ts_valid_bits_ > 0)) {
                 VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
                 qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
                 qi.queryCount = 2;
@@ -1641,6 +1643,13 @@ private:
             sl.pool = desc_pool_;
         }
         UseSlot(0);
+        // Why "GPU busy" may read 0 (Mali G76: always 0 ms): no timestamps used, or the driver writes no real ones.
+        LOGI(kTag, "GPU timestamps: timestampComputeAndGraphics %d, queue valid bits %u, period %.3f ns: %s%s",
+             int(props_.limits.timestampComputeAndGraphics), ts_valid_bits_, props_.limits.timestampPeriod,
+             slots_[0].ts ? (props_.limits.timestampComputeAndGraphics ? "used" : "used (gpu_timestamps = 1)")
+                          : "not used, GPU busy not measured",
+             dsr::GetRuntime().config.gpu_time_fences ? "; GPU time also from fences (gpu_time_fences = 1)" : "");
+        if (dsr::GetRuntime().config.gpu_time_fences) StartFenceTimer();
         VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         vkCreateSemaphore(device_, &sci, nullptr, &acquire_sem_);
         vkCreateSemaphore(device_, &sci, nullptr, &render_sem_);
@@ -3258,11 +3267,115 @@ private:
         if (!sl.ts || !sl.ts_written) return;
         sl.ts_written = false;
         uint64_t t[2];
-        if (vkGetQueryPoolResults(device_, sl.ts, 0, 2, sizeof(t), t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0]) {
+        const VkResult r = vkGetQueryPoolResults(device_, sl.ts, 0, 2, sizeof(t), t, 8, VK_QUERY_RESULT_64_BIT);
+        if (r == VK_SUCCESS && t[1] > t[0]) {
             const double ms = double(t[1] - t[0]) * props_.limits.timestampPeriod / 1e6;
             gpu_busy_ms_ += ms;
-            dsr::ReportGpuFrameTime(ms);  // fps = auto weighs it against the frame period
+            ts_ok_++;
+            // fps = auto weighs it against the frame period (with gpu_time_fences, the fence thread reports per frame)
+            if (!fence_timing_) dsr::ReportGpuFrameTime(ms);
+        } else if (r != VK_SUCCESS) {
+            ts_not_ready_++;
+        } else {
+            // Equal or zero: the driver writes no real timestamps. Logged once, so a log tells which.
+            static bool logged = false;
+            if (!logged) LOGW(kTag, "GPU timestamps unusable: start %llu, end %llu", (unsigned long long)t[0], (unsigned long long)t[1]);
+            logged = true;
+            ts_unusable_++;
         }
+    }
+    uint32_t ts_valid_bits_ = 0;  // the queue family's timestampValidBits
+    uint64_t ts_ok_ = 0, ts_not_ready_ = 0, ts_unusable_ = 0;
+
+    // settings gpu_time_fences = 1: GPU time from when submissions finish, for drivers whose timestamps read 0 (Mali
+    // G76 r26: "GPU busy 0 ms", so fps = auto saw only the CPU). After each submission the recorder submits an empty
+    // batch with a fence of this thread's own (a submission's fence also covers all work submitted before it); the
+    // thread waits for them in order and counts done - max(submitted, previous done): the GPU's busy time plus its own
+    // wake-up latency. The present's submission (blit, waits for the swapchain image) is counted apart. The sum per
+    // frame goes to fps = auto. Own fences: the slots' fences are waited and reset by the render thread.
+    struct FenceJob {
+        VkFence fence;
+        int64_t submit_ns;
+        bool present;
+    };
+    bool fence_timing_ = false;
+    std::mutex ft_m_;
+    std::condition_variable ft_cv_;
+    std::deque<FenceJob> ft_jobs_;
+    std::vector<VkFence> ft_free_;
+    int ft_fences_ = 0;
+    std::atomic<uint64_t> ft_busy_us_{0}, ft_present_us_{0}, ft_frames_{0}, ft_timed_{0}, ft_untimed_{0};
+    static int64_t SteadyNs() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void StartFenceTimer() {
+        if (fence_timing_) return;
+        fence_timing_ = true;
+        std::thread([this] {
+            pthread_setname_np(pthread_self(), "dsr-gputime");
+            dsr::platform::UseAllCores();  // asleep nearly all the time: no need for a fast core
+            int64_t prev_done = 0;
+            double frame_ms = 0;
+            for (;;) {
+                FenceJob j;
+                {
+                    std::unique_lock<std::mutex> lk(ft_m_);
+                    ft_cv_.wait(lk, [&] { return !ft_jobs_.empty(); });
+                    j = ft_jobs_.front();
+                    ft_jobs_.pop_front();
+                }
+                VkResult r;
+                while ((r = vkWaitForFences(device_, 1, &j.fence, VK_TRUE, 1'000'000'000ull)) == VK_TIMEOUT)
+                    std::this_thread::yield();  // Mali sometimes returns VK_TIMEOUT at once (see WaitSlotFence)
+                const int64_t done = SteadyNs();
+                if (r == VK_SUCCESS) {
+                    const double ms = double(done - std::max(j.submit_ns, prev_done)) / 1e6;
+                    if (j.present) {
+                        ft_present_us_.fetch_add(uint64_t(ms * 1000.0), std::memory_order_relaxed);
+                        ft_frames_.fetch_add(1, std::memory_order_relaxed);
+                        dsr::ReportGpuFrameTime(frame_ms);
+                        frame_ms = 0;
+                    } else {
+                        ft_busy_us_.fetch_add(uint64_t(ms * 1000.0), std::memory_order_relaxed);
+                        frame_ms += ms;
+                    }
+                    ft_timed_.fetch_add(1, std::memory_order_relaxed);
+                }
+                prev_done = done;
+                vkResetFences(device_, 1, &j.fence);
+                std::lock_guard<std::mutex> lk(ft_m_);
+                ft_free_.push_back(j.fence);
+            }
+        }).detach();
+    }
+    // Recorder, right after a submission (submit_ns: just before it).
+    void TimeSubmission(int64_t submit_ns, bool present) {
+        VkFence f = VK_NULL_HANDLE;
+        {
+            std::lock_guard<std::mutex> lk(ft_m_);
+            if (!ft_free_.empty()) {
+                f = ft_free_.back();
+                ft_free_.pop_back();
+            } else if (ft_fences_ < 16) {  // more in flight: the GPU is far behind; not timed
+                VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+                if (vkCreateFence(device_, &fci, nullptr, &f) == VK_SUCCESS) ft_fences_++;
+                else f = VK_NULL_HANDLE;
+            }
+        }
+        if (f && vkQueueSubmit(queue_, 0, nullptr, f) != VK_SUCCESS) {
+            std::lock_guard<std::mutex> lk(ft_m_);
+            ft_free_.push_back(f);
+            f = VK_NULL_HANDLE;
+        }
+        if (!f) {
+            ft_untimed_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(ft_m_);
+            ft_jobs_.push_back({f, submit_ns, present});
+        }
+        ft_cv_.notify_one();
     }
 
     // Submits the current slot's commands and moves to the other slot. The CPU waits only if that slot's
@@ -3307,12 +3420,14 @@ private:
             si.signalSemaphoreCount = 1;
             si.pSignalSemaphores = &signal;
         }
+        const int64_t submit_ns = fence_timing_ ? SteadyNs() : 0;
         VkResult r = vkQueueSubmit(queue_, 1, &si, sl.fence);
         if (r != VK_SUCCESS) {
             static std::atomic<bool> logged{false};
             if (!logged.exchange(true)) LOGW(kTag, "vkQueueSubmit failed: %d", r);
             vkQueueSubmit(queue_, 0, nullptr, sl.fence);  // the render thread waits on this fence
         }
+        if (fence_timing_) TimeSubmission(submit_ns, signal != VK_NULL_HANDLE && signal == render_sem_);
         sl.submits_done.fetch_add(1, std::memory_order_release);
     }
     // A slot's fence may be waited on once the recorder has submitted it (a fence must not be used by two
@@ -6407,6 +6522,18 @@ private:
              fence_retries_ ? ("; GPU fence waits repeated: " + std::to_string(fence_retries_)).c_str() : "");
         fence_retries_ = 0;
         gpu_busy_ms_ = 0;
+        if (ts_not_ready_ || ts_unusable_)  // why GPU busy reads low or 0
+            LOGI(kTag, "GPU timestamps in the last 10 s: %llu used, %llu not available, %llu unusable (equal or zero)",
+                 (unsigned long long)ts_ok_, (unsigned long long)ts_not_ready_, (unsigned long long)ts_unusable_);
+        ts_ok_ = ts_not_ready_ = ts_unusable_ = 0;
+        if (fence_timing_) {
+            const double busy = ft_busy_us_.exchange(0) / 1000.0, present = ft_present_us_.exchange(0) / 1000.0;
+            const uint64_t frames = ft_frames_.exchange(0), timed = ft_timed_.exchange(0), untimed = ft_untimed_.exchange(0);
+            LOGI(kTag, "GPU busy (fences) %.0f ms in the last 10 s (%.1f ms per frame, %llu frames; present %.1f ms per "
+                 "frame; %llu submissions timed, %llu not)",
+                 busy, frames ? busy / double(frames) : 0.0, (unsigned long long)frames,
+                 frames ? present / double(frames) : 0.0, (unsigned long long)timed, (unsigned long long)untimed);
+        }
         stat_lists_ = list_counter_;
         prehash_used_ = prehash_inline_ = 0;
         if (geo_buf_) {

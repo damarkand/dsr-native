@@ -524,6 +524,8 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                 have_present_mode = true;
             } else if (!strcmp(key, "settings_version")) settings_version = v;
             else if (!strcmp(key, "mali_barriers")) cfg->mali_barriers = v != 0;
+            else if (!strcmp(key, "gpu_timestamps")) cfg->gpu_timestamps = v != 0;
+            else if (!strcmp(key, "gpu_time_fences")) cfg->gpu_time_fences = v != 0;
             else if (!strcmp(key, "performance_mode")) cfg->performance_mode = v != 0;
             else if (!strcmp(key, "texture_mip_skip")) cfg->texture_mip_skip = std::clamp(v, 0, 1);
             else if (!strcmp(key, "pass_load_skip")) cfg->pass_load_skip = v != 0;
@@ -610,6 +612,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
          int(cfg->bc_enabler), cfg->language.c_str(), cfg->render_scale, cfg->shadow_compare,
          int(cfg->game_hooks), int(cfg->skip_intro), int(cfg->render_pass_objects), int(cfg->mali_barriers), int(cfg->performance_mode), cfg->texture_mip_skip, int(cfg->lighter_post_fx), cfg->present_mode.c_str(),
          cfg->hole_test);
+    LOGI(kTag, "settings: gpu_timestamps %d, gpu_time_fences %d", int(cfg->gpu_timestamps), int(cfg->gpu_time_fences));
     if (!g_custom_game_dir.empty()) LOGI(kTag, "settings: game_dir %s", g_custom_game_dir.c_str());
     LOGI(kTag, "settings: touch controls %s, opacity %.2f, camera speed %.2f%s", g_touch.enabled ? "on" : "off",
          g_touch.opacity, g_touch.camera_speed, g_touch.camera_invert ? ", camera inverted" : "");
